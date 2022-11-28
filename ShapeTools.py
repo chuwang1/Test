@@ -73,7 +73,7 @@ class ShapeBuilder(ModelBuilder):
         else:
             self.out.obs = self.out.binVars
         self.doSet("observables",self.out.obs)
-        if len(self.DC.obs) != 0: 
+        if len(self.DC.obs) != 0 and not self.options.noData:
             self.doCombinedDataset()
     def doIndividualModels(self):
         if self.options.verbose:
@@ -142,8 +142,12 @@ class ShapeBuilder(ModelBuilder):
                 else:
                     sigcoeffs.append(coeff)
             if self.options.verbose > 1: print "Creating RooAddPdf %s with %s elements" % ("pdf_bin"+b, coeffs.getSize())
-            if channelBinParFlag: 
-                prop = self.addObj(ROOT.CMSHistErrorPropagator, "prop_bin%s" % b, "", pdfs.at(0).getXVar(), pdfs, coeffs)
+            if channelBinParFlag:
+                if self.options.useCMSHistSum:
+                    prop = self.addObj(ROOT.CMSHistSum, "prop_bin%s" % b, "", pdfs.at(0).getXVar(), pdfs, coeffs)
+                    prop.setAttribute('CachingPdf_NoClone', True)
+                else:
+                    prop = self.addObj(ROOT.CMSHistErrorPropagator, "prop_bin%s" % b, "", pdfs.at(0).getXVar(), pdfs, coeffs)
                 prop.setAttribute('CachingPdf_Direct', True)
                 if self.DC.binParFlags[b][0] >= 0.:
                     bbb_args = prop.setupBinPars(self.DC.binParFlags[b][0])
@@ -154,7 +158,10 @@ class ShapeBuilder(ModelBuilder):
                         parname = n
                         self.out._import(arg)
                         if arg.getAttribute("createGaussianConstraint"):
-                            self.doObj("%s_Pdf" % n, "SimpleGaussianConstraint", "%s, %s_In[0,%s], %s" % (n, n, '-7,7', '1.0'), True)
+                            if self.options.noOptimizePdf:
+                                self.doObj("%s_Pdf" % n, "Gaussian", "%s, %s_In[0,%s], %s" % (n, n, '-7,7', '1.0'), True)
+                            else:
+                                self.doObj("%s_Pdf" % n, "SimpleGaussianConstraint", "%s, %s_In[0,%s], %s" % (n, n, '-7,7', '1.0'), True)
                             self.out.var(n).setVal(0)
                             self.out.var(n).setError(1)
                             if self.options.optimizeBoundNuisances: self.out.var(n).setAttribute("optimizeBounds")
@@ -198,7 +205,11 @@ class ShapeBuilder(ModelBuilder):
                 if not self.options.noBOnly: sum_b.setAttribute('forceGen'+self.pdfModes[b].title())
             addSyst = False
             if    self.options.moreOptimizeSimPdf == "none":   addSyst = True
-            elif  self.options.moreOptimizeSimPdf == "lhchcg": addSyst = (i > 1)
+            # New behaviour for "lhchcg" mode - since autoMCStats constraints are only added to their respective channels,
+            # we can't get away with only adding a constraint production to the first channel. Instead we will always enter
+            # the code block below (addSyst=True), and only add the normal nuisPdfs on i==0, while the binconstraints will
+            # always be added.
+            elif  self.options.moreOptimizeSimPdf == "lhchcg": addSyst = True
             elif  self.options.moreOptimizeSimPdf == "cms":
                 if self.options.noOptimizePdf: raise RuntimeError, "--optimize-simpdf-constraints=cms is incompatible with --no-optimize-pdfs"
                 addSyst = False
@@ -209,7 +220,7 @@ class ShapeBuilder(ModelBuilder):
                 	self.renameObj("pdf_bin%s_bonly" % b, "pdf_bin%s_bonly_nuis" % b)
                 # now we multiply by all the nuisances, but avoiding nested products
                 # so we first make a list of all nuisances plus the RooAddPdf
-                if len(self.DC.systs):
+                if len(self.DC.systs) and not (self.options.moreOptimizeSimPdf == "lhchcg" and i > 0):
                     sumPlusNuis_s = ROOT.RooArgList(self.out.nuisPdfs)
                 else:
                     sumPlusNuis_s = ROOT.RooArgList()
@@ -311,7 +322,7 @@ class ShapeBuilder(ModelBuilder):
         for i in xrange(1, branchNodes.getSize()):
             arg = branchNodes.at(i)
             if arg.GetName() in dupNames and arg not in dupObjs:
-                if self.options.verbose > 1 : stderr.write('Object %s is duplicated, will rename to %s_%s'%(arg.GetName(),arg.GetName(),postFix))
+                if self.options.verbose > 1 : stderr.write('Object %s is duplicated, will rename to %s_%s\n'%(arg.GetName(),arg.GetName(),postFix))
                 arg.SetName(arg.GetName() + '_%s' % postFix)
             # if arg.GetName() in dupNames and arg in dupObjs:
                 # print 'Objected %s is repeated' % arg.GetName()
@@ -421,15 +432,8 @@ class ShapeBuilder(ModelBuilder):
             if self.options.verbose > 1: stderr.write("Observables: %s\n" % str(shapeObs.keys()))
             if len(shapeObs.keys()) != 1:
                 self.out.binVars = ROOT.RooArgSet()
-                # Custom code starts - LC 5/14/19
-                for obs_key in shapeObs.keys():
-                     # RooArgSet does not have method to add another RooArgSet (RooCollection does!) so we have to manually loop over the RooArgSet contents (in obs) 
-                     if ',' in obs_key: # if multiple vars and looking at a RooArgSet value
-                         for k in obs_key.split(','):
-                             self.out.binVars.add(shapeObs[obs_key].find(k), True)
-                     else:
-                         self.out.binVars.add(shapeObs[obs_key], True)
-                 # Custom code ends
+                for obs in shapeObs.values():
+                     self.out.binVars.add(obs, True)
             else:
                 self.out.binVars = shapeObs.values()[0]
             self.out._import(self.out.binVars)
@@ -695,16 +699,7 @@ class ShapeBuilder(ModelBuilder):
                     pdfs.Add(self.shape2Pdf(shapeDown,channel,process))
                 histpdf =  nominalPdf if nominalPdf.InheritsFrom("RooDataHist") else nominalPdf.dataHist()
                 xvar = histpdf.get().first()
-                # Custom code start - LC 5/14/19
-                histpdfSubset = histpdf.get().Clone()
-                histpdfSubset.remove(xvar)
-                if histpdfSubset.first() != False:
-                    yvar = histpdfSubset.first() # y is a little more complex
-                    rhp = ROOT.FastVerticalInterpHistPdf2D2("shape%s_%s_%s_morph" % (postFix,channel,process), "", xvar, yvar, False, pdfs, coeffs, qrange, qalgo)
-                else:
-                    rhp = ROOT.FastVerticalInterpHistPdf2("shape%s_%s_%s_morph" % (postFix,channel,process), "", xvar, pdfs, coeffs, qrange, qalgo)
-                # Custom code ends (plus the next line was commented out)
-                #rhp = ROOT.FastVerticalInterpHistPdf2("shape%s_%s_%s_morph" % (postFix,channel,process), "", xvar, pdfs, coeffs, qrange, qalgo)
+                rhp = ROOT.FastVerticalInterpHistPdf2("shape%s_%s_%s_morph" % (postFix,channel,process), "", xvar, pdfs, coeffs, qrange, qalgo)
                 _cache[(channel,process)] = rhp
                 return rhp
 	    elif nominalPdf.InheritsFrom("RooParametricHist") : 
